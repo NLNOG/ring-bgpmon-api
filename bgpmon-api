@@ -1,0 +1,170 @@
+#!/usr/bin/env perl
+
+use BGPmon::DB;
+use Digest::SHA qw(sha1_hex);
+use Mojo::DOM;
+use Mojolicious::Lite;
+use XML::Simple qw(XMLin XMLout);
+
+my $app 	= app;
+my $config 	= plugin Config => {file => '/etc/bgpmon/bgpmon_api_config.txt'};
+my $db 		= BGPmon::DB->connect("dbi:mysql:database=".$config->{dbname},$config->{dbuser}, $config->{dbpass});
+
+#####PLUGINS#####
+
+plugin 'basic_auth';
+
+#####HELPERS#####
+
+# Define our debugging helper
+helper debug => sub {
+	my ($self, $string) = @_;
+	my $username = $self->stash->{username} || 'unauthenticated';
+	$self->app->log->debug("[$username] $string");
+};
+
+# Define a query cleaner
+helper queryclean => sub {
+	my ($self, $iquery) = @_;
+	my ($query, $result);
+	foreach my $iqkey (sort keys %{$iquery}) {
+		my $iqval = $iquery->{$iqkey};
+		if ($iqkey && $iqval) {
+			$iqval=~s/[';]*//g;
+			$query->{$iqkey} = $iqval;
+		}
+	}
+	return ($query);
+};
+
+# Define our database helper
+helper dbquery => sub {
+	my ($self, $table, $iquery) = @_;
+	return unless ($self && $table);
+
+	my $result;
+
+	my $rs = $db->resultset($table)->search($self->queryclean($iquery));
+	$rs->result_class('DBIx::Class::ResultClass::HashRefInflator');
+	while (my $datum = $rs->next) {
+		push (@{$result}, $datum);
+	}
+
+	return $result;
+};
+
+# Define our XML renderer
+helper render_xml => sub {
+	my ($self, $rootname, $datumname, $data) = @_;
+	my $hdr = '<?xml version="1.0" encoding="UTF-8" ?>';
+	my $xml = XMLout({$datumname=>$data}, NoAttr=>1, NoIndent=>1, RootName=>$rootname);
+	$self->render(text=>($hdr.$xml), type=>'xml');
+};
+
+#####ROUTING#####
+
+# Default route gives us a 'nothing to see here'
+get '/' => 'index';
+
+# All routes downstream of here must be authenticated
+under sub {
+	my $self = shift;
+
+	# Authenticated
+	return $self->basic_auth(
+		api => sub { 
+			my ($username, $password) = @_;
+			my $rs = $db->resultset("Owner")->search({email=>$username, web_pass=>sha1_hex($password)});
+			if ($rs->count) {
+				# Authenticated
+				$self->stash->{username} = $username;
+				$self->stash->{ownerid}  = $rs->first->id;
+				return 1;
+			}
+			elsif ($username && $password) {
+				# UnAuthenticated (bad un/pw)
+				$self->render(status=>401, text=>'bad username/password');
+				return undef;
+			}
+			else {
+				# UnAuthenticated (did not provide)
+				$self->render(status=>401, text=>'access denied');
+				return undef;
+			}
+		}
+	);
+	
+	return undef;
+};
+
+get '/alarms/:id' => {id => undef} => sub {
+	my $self 	= shift;
+	my $alarms	= $self->dbquery('Alarm',{id=>$self->stash->{id}, owner=>$self->stash->{ownerid}}) || $self->render(status=>200, text=>'');
+	$self->respond_to(
+		xml  => sub { $self->render_xml('alarms', 'alarm', $alarms) },
+		any  => {json => {alarms=>$alarms}},
+	);
+};
+
+post '/alarms' => sub  {
+	my $self = shift;
+	$self->respond_to(any=>sub{
+		my $in;
+		my $format = $self->stash->{'mojo.captures'}->{'format'};
+
+		if ($format eq 'xml') {		# Capture XML input
+			$in = XMLin( $self->req->body );
+		}
+		else {				# Capture JSON input
+			$in = Mojo::JSON->decode( $self->req->body );
+		}
+
+		my $out = $self->queryclean($in);# Clean up incoming query
+
+		use Data::Dumper;
+		$self->debug(Dumper($in));
+
+		if ($format eq 'xml') {		# Produce XML output
+			$self->render_xml('alarms', 'alarm', $in);
+		}
+		else {				# Produce JSON input
+			$self->render_json({alarms => $in});
+		}
+	});
+};
+	
+app->start;
+
+######DATA#######
+
+__DATA__
+
+@@ not_found.html.ep
+not found
+
+@@ exception.development.xml.ep
+<error>
+	<message><%= $exception->message %></message>
+</error>
+
+@@ exception.xml.ep
+<error>
+	<message>Internal Server Error</message>
+</error>
+
+@@ exception.development.json.ep
+{"error":{"message":"<%= $exception->message %>"}}
+
+@@ exception.json.ep
+{"error":{"message":"Internal Server Error"}}
+
+@@ index.html.ep
+% layout 'default';
+% title 'Welcome';
+Nothing to see here, move along!
+
+@@ layouts/default.html.ep
+<!doctype html><html>
+  <head><title><%= title %></title></head>
+  <body><%= content %></body>
+</html>
